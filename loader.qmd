@@ -1,0 +1,41 @@
+---
+title: "TCGA KIRC data loading and cohort audit"
+format: html
+---
+
+This short notebook verifies the three inputs used by
+[the main analysis](project.Rmd). Patient identifiers are the first 12
+characters of a TCGA barcode. Expression samples are restricted to primary
+solid tumors (sample type `01`), with one aliquot retained per patient.
+
+```{r}
+files <- c(
+  clinical = "data/data_clinical_patient.txt.gz",
+  mutation = "data/data_mutations.txt.gz",
+  expression = "data/RNAseq_KIRC.csv.gz"
+)
+missing <- files[!file.exists(files)]
+if (length(missing)) stop("Missing data files: ", paste(missing, collapse = ", "))
+
+clinical <- read.delim(files["clinical"], skip = 4, check.names = FALSE)
+mutation <- read.delim(files["mutation"], check.names = FALSE)
+expression <- read.csv(files["expression"], check.names = FALSE)
+
+clinical_ids <- clinical$PATIENT_ID[
+  !is.na(clinical$OS_MONTHS) & grepl("^[01]:", clinical$OS_STATUS)
+]
+mutation_ids <- substr(mutation$Tumor_Sample_Barcode, 1, 12)
+barcodes <- names(expression)[-1]
+primary_barcodes <- barcodes[substr(barcodes, 14, 15) == "01"]
+expression_ids <- unique(substr(primary_barcodes, 1, 12))
+
+common_ids <- Reduce(intersect, list(clinical_ids, mutation_ids, expression_ids))
+data.frame(
+  dataset = c("Clinical with overall survival", "Mutation", "Primary tumor RNA-seq", "Intersection"),
+  patients = c(length(unique(clinical_ids)), length(unique(mutation_ids)),
+               length(expression_ids), length(common_ids))
+)
+stopifnot(length(common_ids) == 354)
+```
+
+The raw input provenance and limitations are documented in the README.

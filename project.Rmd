@@ -1,0 +1,475 @@
+---
+title: "TCGA Kidney Renal Clear Cell Carcinoma Multi-Omics Analysis"
+author: "Andrew Li"
+date: "2025-11-20"
+output: html_document
+---
+
+This notebook runs the analyses in this repository. Compressed TCGA-derived
+input files are included in `data/`.
+
+```{r setup, message=FALSE, warning=FALSE}
+required_files <- c("data/data_clinical_patient.txt.gz",
+                    "data/data_mutations.txt.gz", "data/RNAseq_KIRC.csv.gz")
+missing_files <- required_files[!file.exists(required_files)]
+if (length(missing_files)) {
+  stop("Missing input files: ", paste(missing_files, collapse = ", "),
+       ". See README.md for data setup.")
+}
+
+library(dplyr)
+library(survival)
+library(ggplot2)
+dir.create("results", showWarnings = FALSE)
+
+simplify_barcode <- function(x) substr(x, 1, 12)
+knitr::opts_chunk$set(fig.width = 7, fig.height = 5)
+
+## Load and harmonize data
+
+clin <- read.delim(
+  "data/data_clinical_patient.txt.gz",
+  skip        = 4,
+  header      = TRUE,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+clinical_data <- clin %>%
+  transmute(
+    patient_barcode = PATIENT_ID,
+    os_time  = as.numeric(OS_MONTHS),
+    os_event = case_when(
+      grepl("^1:", OS_STATUS) ~ 1L,
+      grepl("^0:", OS_STATUS) ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    age      = as.numeric(AGE),
+    stage    = AJCC_PATHOLOGIC_TUMOR_STAGE
+  ) %>%
+  filter(!is.na(os_time), !is.na(os_event))
+
+mut <- read.delim(
+  "data/data_mutations.txt.gz",
+  header      = TRUE,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+mut$patient_barcode <- simplify_barcode(mut$Tumor_Sample_Barcode)
+
+expr_df <- read.csv(
+  "data/RNAseq_KIRC.csv.gz",
+  check.names       = FALSE,
+  stringsAsFactors  = FALSE
+)
+
+gene_ids <- expr_df[[1]]
+expr_mat <- as.matrix(expr_df[, -1, drop = FALSE])
+rownames(expr_mat) <- gene_ids
+stopifnot(!anyNA(expr_mat), all(expr_mat >= 0),
+          all(expr_mat == round(expr_mat)), !anyDuplicated(gene_ids))
+
+full_barcodes <- colnames(expr_mat)
+# TCGA sample type 01 is primary solid tumor. Exclude normal tissue (11)
+# and the single 05 sample before selecting one aliquot per patient.
+primary_tumor <- substr(full_barcodes, 14, 15) == "01"
+expr_mat <- expr_mat[, primary_tumor, drop = FALSE]
+patient_ids <- simplify_barcode(colnames(expr_mat))
+
+dup <- duplicated(patient_ids)
+expr_mat <- expr_mat[, !dup, drop = FALSE]
+colnames(expr_mat) <- patient_ids[!dup]
+
+common_patients <- Reduce(
+  intersect,
+  list(
+    clinical_data$patient_barcode,
+    unique(mut$patient_barcode),
+    colnames(expr_mat)
+  )
+)
+
+clinical_data <- clinical_data[clinical_data$patient_barcode %in% common_patients, ]
+mut           <- mut[mut$patient_barcode %in% common_patients, ]
+expr_mat      <- expr_mat[, common_patients, drop = FALSE]
+clinical_data <- clinical_data[match(common_patients, clinical_data$patient_barcode), ]
+stopifnot(identical(clinical_data$patient_barcode, colnames(expr_mat)))
+cat("Patients with clinical, mutation, and primary-tumor expression data:",
+    length(common_patients), "\n")
+
+## Mutation
+
+gene_summary <- mut %>%
+  group_by(Hugo_Symbol) %>%
+  summarise(
+    MutatedSamples = n_distinct(patient_barcode),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(MutatedSamples))
+
+print(head(gene_summary, 10))
+
+top_gene <- gene_summary$Hugo_Symbol[1]
+cat("Top mutated gene:", top_gene, "\n")
+
+# Barplot of top 20 mutated genes
+top20 <- head(gene_summary, 20)
+
+p_top20 <- ggplot(top20, aes(x = reorder(Hugo_Symbol, MutatedSamples), y = MutatedSamples)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 20 mutated genes", x = "Gene", y = "Number of patients mutated") +
+  theme_minimal()
+
+ggsave("top20_mutated_genes.png", p_top20, width = 6, height = 4)
+
+## Mutation clustering
+
+non_syn_variants <- c(
+  "Missense_Mutation", "Nonsense_Mutation",
+  "Frame_Shift_Del", "Frame_Shift_Ins",
+  "Splice_Site", "In_Frame_Del", "In_Frame_Ins"
+)
+
+mut_ns <- mut[mut$Variant_Classification %in% non_syn_variants, ]
+
+gp_tab <- table(mut_ns$patient_barcode, mut_ns$Hugo_Symbol)
+gp_bin <- (gp_tab > 0) * 1
+
+gene_counts <- colSums(gp_bin)
+top20_genes <- names(sort(gene_counts, decreasing = TRUE))[1:min(20, length(gene_counts))]
+gp_top      <- gp_bin[, top20_genes, drop = FALSE]
+
+# Ward.D2 is defined for Euclidean distances. Binary observations remain 0/1.
+d_mut   <- dist(gp_top, method = "euclidean")
+hc_mut  <- hclust(d_mut, method = "ward.D2")
+mut_clusters <- cutree(hc_mut, k = 2)
+
+cluster_df <- data.frame(
+  patient_barcode = rownames(gp_top),
+  mut_cluster     = factor(mut_clusters)
+)
+
+clinical_data <- left_join(clinical_data, cluster_df, by = "patient_barcode")
+clin_mut      <- clinical_data[!is.na(clinical_data$mut_cluster) &
+                                 clinical_data$os_time > 0, ]
+
+surv_obj_clust <- Surv(time = clin_mut$os_time, event = clin_mut$os_event)
+fit_km_clust   <- survfit(surv_obj_clust ~ mut_cluster, data = clin_mut)
+
+png("survival_mutation_clusters.png", width = 800, height = 600)
+plot(
+  fit_km_clust, col = c("#1f77b4", "#d62728"), lwd = 2,
+  xlab = "Time (months)", ylab = "Overall survival",
+  main = "OS by mutation-based clusters"
+)
+legend("topright", legend = levels(clin_mut$mut_cluster),
+       col = c("#1f77b4", "#d62728"), lwd = 2)
+dev.off()
+
+if (!all(is.na(clin_mut$stage))) {
+  tab_stage <- table(clin_mut$mut_cluster, clin_mut$stage)
+  print(tab_stage)
+    if (all(tab_stage >= 5)) {
+    print(chisq.test(tab_stage))
+  }
+}
+
+
+## Survival by top mutated gene
+
+mut_topgene <- unique(mut_ns$patient_barcode[mut_ns$Hugo_Symbol == top_gene])
+clinical_data$top_gene_mut <- ifelse(clinical_data$patient_barcode %in% mut_topgene, 1L, 0L)
+
+clin_top <- clinical_data[clinical_data$os_time > 0, ]
+surv_obj_top <- Surv(time = clin_top$os_time, event = clin_top$os_event)
+fit_km_top   <- survfit(surv_obj_top ~ top_gene_mut, data = clin_top)
+
+png("survival_top_gene.png", width = 800, height = 600)
+plot(
+  fit_km_top, col = c("#1f77b4", "#d62728"), lwd = 2,
+  xlab = "Time (months)", ylab = "Overall survival",
+  main = paste("OS by", top_gene, "mutation status")
+)
+legend("topright", legend = c("WT", "Mut"),
+       col = c("#1f77b4", "#d62728"), lwd = 2)
+dev.off()
+
+# Cox model adjusted for age
+fit_cox <- coxph(surv_obj_top ~ top_gene_mut + age, data = clin_top)
+print(summary(fit_cox))
+write.csv(as.data.frame(summary(fit_cox)$coefficients),
+          "results/cox_vhl_age.csv")
+
+## Expression, log-CPM, PCA, and clustering
+
+counts_mat <- expr_mat
+lib_sizes  <- colSums(counts_mat)
+cpm        <- t(t(counts_mat) / lib_sizes) * 1e6
+log_cpm    <- log2(cpm + 1)
+
+keep_genes <- rowSums(counts_mat >= 10) >= (0.25 * ncol(counts_mat))
+log_cpm    <- log_cpm[keep_genes, , drop = FALSE]
+
+gene_vars      <- apply(log_cpm, 1, var)
+top_n          <- min(500, length(gene_vars))
+top_genes_expr <- names(sort(gene_vars, decreasing = TRUE))[1:top_n]
+log_top        <- log_cpm[top_genes_expr, , drop = FALSE]
+
+pca_res <- prcomp(t(log_top), scale. = FALSE)
+pca_df  <- as.data.frame(pca_res$x[, 1:2])
+pca_df$patient_barcode <- rownames(pca_df)
+pca_df <- left_join(
+  pca_df,
+  clinical_data[, c("patient_barcode", "top_gene_mut")],
+  by = "patient_barcode"
+)
+
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = factor(top_gene_mut))) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("#1f77b4", "#d62728"), labels = c("WT", "Mut")) +
+  labs(title = "PCA of top variable genes (log-CPM)",
+       color = paste(top_gene, "mutation")) +
+  theme_minimal()
+
+ggsave("pca_top_variable_genes.png", p_pca, width = 6, height = 4)
+
+# Ward clustering for expression
+dist_expr <- dist(t(log_top), method = "euclidean")
+hc_expr   <- hclust(dist_expr, method = "ward.D2")
+expr_clusters <- cutree(hc_expr, k = 2)
+
+png("expression_cluster_heatmap.png", width = 1200, height = 850)
+scaled_top <- t(scale(t(log_top)))
+scaled_top[] <- pmax(-2, pmin(2, scaled_top))
+heatmap(scaled_top, Rowv = TRUE, Colv = as.dendrogram(hc_expr),
+        scale = "none", breaks = seq(-2, 2, length.out = 102),
+        labRow = NA, labCol = NA,
+        col = colorRampPalette(c("#2166ac", "white", "#b2182b"))(101),
+        main = "Top 500 variable genes (row-scaled log-CPM)")
+dev.off()
+
+expr_cluster_df <- data.frame(
+  patient_barcode = colnames(log_top),
+  expr_cluster    = factor(expr_clusters)
+)
+
+clinical_data <- left_join(clinical_data, expr_cluster_df, by = "patient_barcode")
+clin_expr <- clinical_data[!is.na(clinical_data$expr_cluster) &
+                                   clinical_data$os_time > 0, ]
+
+surv_obj_expr <- Surv(time = clin_expr$os_time, event = clin_expr$os_event)
+fit_km_expr   <- survfit(surv_obj_expr ~ expr_cluster, data = clin_expr)
+
+png("survival_expression_clusters.png", width = 800, height = 600)
+plot(
+  fit_km_expr, col = c("#1f77b4", "#d62728"), lwd = 2,
+  xlab = "Time (months)", ylab = "Overall survival",
+  main = "OS by expression-based clusters"
+)
+legend("topright", legend = levels(clin_expr$expr_cluster),
+       col = c("#1f77b4", "#d62728"), lwd = 2)
+dev.off()
+
+# Stage vs expression clusters
+if (!all(is.na(clin_expr$stage))) {
+  tab_stage_expr <- table(clin_expr$expr_cluster, clin_expr$stage)
+  print(tab_stage_expr)
+  if (all(tab_stage_expr >= 5)) {
+    print(chisq.test(tab_stage_expr))
+  }
+}
+
+## DE (Mutation vs WT for top_gene, t-tests on log-CPM)
+
+mutated_patients <- clinical_data$patient_barcode[clinical_data$top_gene_mut == 1]
+group_labels     <- ifelse(colnames(log_cpm) %in% mutated_patients, "Mut", "WT")
+
+# This is an exploratory two-sample t-test on log-CPM, not DESeq2.
+# Both groups must contain enough patients for a t-test.
+stopifnot(sum(group_labels == "Mut") >= 2, sum(group_labels == "WT") >= 2)
+cat("Expression comparison: ", sum(group_labels == "Mut"), " Mut; ",
+    sum(group_labels == "WT"), " WT\n", sep = "")
+de_res <- apply(log_cpm, 1, function(x) {
+  t.out <- tryCatch(
+    t.test(x[group_labels == "Mut"], x[group_labels == "WT"]),
+    error = function(e) NULL
+  )
+  if (is.null(t.out)) {
+    c(stat = NA, pval = 1)
+  } else {
+    c(stat = unname(t.out$statistic), pval = t.out$p.value)
+  }
+})
+de_res <- t(de_res)
+
+# Log2 Mut - WT
+logfc <- rowMeans(log_cpm[, group_labels == "Mut", drop = FALSE]) -
+         rowMeans(log_cpm[, group_labels == "WT", drop = FALSE])
+
+de_df <- data.frame(
+  gene   = rownames(log_cpm),
+  logFC  = logfc,
+  t_stat = de_res[, "stat"],
+  pval   = de_res[, "pval"],
+  stringsAsFactors = FALSE
+)
+de_df$padj <- p.adjust(de_df$pval, method = "BH")
+de_df      <- de_df[order(de_df$padj), ]
+print(head(de_df, 10))
+
+# Volcano plot
+p_volc <- ggplot(de_df, aes(x = logFC, y = -log10(pmax(padj, .Machine$double.xmin)))) +
+  geom_point(alpha = 0.5) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "red") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  labs(
+    title = paste("DE (log-CPM):", top_gene, "Mut vs WT"),
+    x = "log2 fold change",
+    y = "-log10(FDR)"
+  ) +
+  theme_minimal()
+
+ggsave("volcano_DE_top_gene_ttest.png", p_volc, width = 6, height = 4)
+
+## DESeq2 differential expression between expression clusters
+
+# These clusters were learned from the same expression data. The comparison is
+# descriptive and its adjusted p-values are not independent subtype validation.
+library(DESeq2)
+write.csv(de_df, "results/vhl_log_cpm_ttest.csv", row.names = FALSE)
+
+filtered_counts <- counts_mat[keep_genes, , drop = FALSE]
+storage.mode(filtered_counts) <- "integer"
+cluster_metadata <- data.frame(
+  expr_cluster = factor(expr_clusters[colnames(filtered_counts)], levels = c("1", "2")),
+  row.names = colnames(filtered_counts)
+)
+stopifnot(!anyNA(cluster_metadata$expr_cluster))
+
+dds <- DESeqDataSetFromMatrix(
+  countData = filtered_counts,
+  colData = cluster_metadata,
+  design = ~ expr_cluster
+)
+dds <- DESeq(dds, quiet = TRUE)
+cluster_res <- results(dds, contrast = c("expr_cluster", "2", "1"))
+cluster_de <- data.frame(
+  gene = rownames(cluster_res),
+  as.data.frame(cluster_res),
+  row.names = NULL
+)
+cluster_de <- cluster_de[order(cluster_de$padj, na.last = TRUE), ]
+write.csv(cluster_de, "results/deseq2_expression_clusters.csv", row.names = FALSE)
+
+cluster_de$significant <- with(
+  cluster_de,
+  !is.na(padj) & padj < 0.05 & abs(log2FoldChange) > 1
+)
+cat("DESeq2 genes with FDR < 0.05 and |log2 fold change| > 1:",
+    sum(cluster_de$significant), "\n")
+print(head(cluster_de, 10))
+
+p_cluster_volcano <- ggplot(
+  cluster_de[!is.na(cluster_de$padj), ],
+  aes(x = log2FoldChange,
+      y = -log10(pmax(padj, .Machine$double.xmin)),
+      color = significant)
+) +
+  geom_point(alpha = 0.5, size = 0.8) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  scale_color_manual(values = c("FALSE" = "grey65", "TRUE" = "#b2182b"),
+                     labels = c("Other", "Passes cutoffs")) +
+  labs(title = "DESeq2: expression cluster 2 versus cluster 1",
+       x = "log2 fold change", y = "-log10(FDR)", color = NULL) +
+  theme_minimal()
+ggsave("volcano_DESeq2_expression_clusters.png", p_cluster_volcano,
+       width = 7, height = 5)
+
+## GO biological-process enrichment
+
+# The reference tables are derived from HGNC and Gene Ontology snapshots; see
+# reference/README.md. The background is the set of DESeq2-tested, mapped genes.
+hgnc_map <- read.delim("reference/ensembl_to_hgnc.tsv.gz")
+go_annotations <- read.delim("reference/go_bp_annotations.tsv.gz")
+go_terms <- read.delim("reference/go_bp_terms.tsv")
+
+stable_ids <- sub("\\.[0-9]+$", "", cluster_de$gene)
+cluster_de$symbol <- hgnc_map$symbol[match(stable_ids, hgnc_map$ensembl_gene_id)]
+universe <- unique(cluster_de$symbol[
+  !is.na(cluster_de$pvalue) & !is.na(cluster_de$symbol)
+])
+go_annotations <- unique(go_annotations[
+  go_annotations$symbol %in% universe, c("go_id", "symbol")
+])
+term_genes <- split(go_annotations$symbol, go_annotations$go_id)
+term_genes <- lapply(term_genes, unique)
+term_genes <- term_genes[vapply(term_genes, length, integer(1)) >= 10 &
+                           vapply(term_genes, length, integer(1)) <= 2000]
+
+enrich_direction <- function(direction, hits) {
+  hits <- intersect(unique(hits[!is.na(hits)]), universe)
+  if (!length(hits)) return(data.frame())
+  rows <- lapply(names(term_genes), function(go_id) {
+    members <- term_genes[[go_id]]
+    overlap <- intersect(hits, members)
+    data.frame(
+      direction = direction,
+      go_id = go_id,
+      term_size = length(members),
+      hit_count = length(overlap),
+      pvalue = phyper(length(overlap) - 1, length(members),
+                      length(universe) - length(members), length(hits),
+                      lower.tail = FALSE),
+      hit_symbols = paste(overlap, collapse = ";")
+    )
+  })
+  do.call(rbind, rows)
+}
+
+up_2 <- cluster_de$symbol[
+  !is.na(cluster_de$padj) & cluster_de$padj < 0.05 &
+    cluster_de$log2FoldChange > 1
+]
+up_1 <- cluster_de$symbol[
+  !is.na(cluster_de$padj) & cluster_de$padj < 0.05 &
+    cluster_de$log2FoldChange < -1
+]
+go_results <- rbind(
+  enrich_direction("Higher in cluster 2", up_2),
+  enrich_direction("Higher in cluster 1", up_1)
+)
+go_results$padj <- p.adjust(go_results$pvalue, method = "BH")
+go_results$term <- go_terms$term[match(go_results$go_id, go_terms$go_id)]
+go_results <- go_results[order(go_results$padj, go_results$pvalue), ]
+write.csv(go_results, "results/go_bp_enrichment.csv", row.names = FALSE)
+cat("GO BP terms with FDR < 0.05:", sum(go_results$padj < 0.05), "\n")
+print(head(go_results[, c("direction", "go_id", "term", "hit_count", "padj")], 10))
+
+significant_go <- go_results[go_results$padj < 0.05, ]
+top_go <- if (nrow(significant_go)) {
+  do.call(rbind, lapply(split(significant_go, significant_go$direction), head, 6))
+} else {
+  significant_go
+}
+if (nrow(top_go)) {
+  short_term <- ifelse(nchar(top_go$term) > 55,
+                       paste0(substr(top_go$term, 1, 52), "..."), top_go$term)
+  top_go$label <- short_term
+  p_go <- ggplot(top_go, aes(x = reorder(label, -log10(padj)),
+                            y = -log10(padj), fill = direction)) +
+    geom_col() +
+    coord_flip() +
+    labs(title = "GO biological processes by expression cluster",
+         x = NULL, y = "-log10(FDR)",
+         caption = "Exploratory: clusters were learned from the same expression data") +
+    theme_minimal()
+  ggsave("go_bp_enrichment.png", p_go, width = 9, height = 6)
+}
+
+writeLines(trimws(capture.output(sessionInfo()), which = "right"),
+           "results/session-info.txt")
+sessionInfo()
+```

@@ -1,0 +1,12 @@
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/
+__pycache__/
+*.pyc
+/*_cache/
+/*_files/
+/project.html
+/project.pdf
+/loader.html
+/loader_files/
