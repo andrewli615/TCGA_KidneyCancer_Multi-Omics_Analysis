@@ -20,4 +20,4 @@ rmarkdown::render("project.Rmd")
 - [Differential-expression and enrichment tables](results/)
 - [Input provenance](data/README.md) and [GO reference provenance](reference/README.md)
 
-The GO results include immune-response, ion-transport, and ion-homeostasis terms. These are **exploratory findings**: the clusters were learned from the same expression data used for differential expression, and their biological interpretation needs independent validation. The exact upstream accession for the supplied RNA-seq matrix was not recorded.
+The GO results include immune-response, ion-transport, and ion-homeostasis terms. These are **exploratory findings**: the clusters were learned from the same expression data used for differential expression, and their biological interpretation needs independent validation.
